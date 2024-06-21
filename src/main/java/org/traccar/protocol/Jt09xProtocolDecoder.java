@@ -1,0 +1,1185 @@
+/*
+ * Copyright 2015 - 2022 Anton Tananaev (anton@traccar.org)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.traccar.protocol;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.net.InetSocketAddress;
+import org.traccar.BaseProtocolDecoder;
+import org.traccar.NetworkMessage;
+import org.traccar.Protocol;
+import org.traccar.helper.BcdUtil;
+import org.traccar.helper.BitUtil;
+import org.traccar.helper.Checksum;
+import org.traccar.helper.DateBuilder;
+import org.traccar.helper.UnitsConverter;
+import org.traccar.model.CellTower;
+import org.traccar.model.Network;
+import org.traccar.model.Position;
+
+import java.net.SocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.sql.SQLException;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.TimeZone;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import static jdk.internal.net.http.common.Log.channel;
+import org.traccar.Context;
+import org.traccar.DeviceSession;
+import org.traccar.helper.DistanceCalculator;
+
+//17 july 2023 //trupti
+//this protocol is same as ttobdnx but we set the ac /on off
+public class Jt09xProtocolDecoder extends BaseProtocolDecoder {
+
+    public Jt09xProtocolDecoder(Protocol protocol) {
+        super(protocol);
+    }
+
+    public static final int MSG_GENERAL_RESPONSE = 0x8001;
+    public static final int MSG_GENERAL_RESPONSE_2 = 0x4401;
+    public static final int MSG_HEARTBEAT = 0x0002;
+    public static final int MSG_HEARTBEAT_2 = 0x0506;
+    public static final int MSG_TERMINAL_REGISTER = 0x0100;
+    public static final int MSG_TERMINAL_REGISTER_RESPONSE = 0x8100;
+    public static final int MSG_TERMINAL_CONTROL = 0x8105;
+    public static final int MSG_TERMINAL_AUTH = 0x0102;
+    public static final int MSG_LOCATION_REPORT = 0x0200;
+    public static final int MSG_LOCATION_BATCH_2 = 0x0210;
+    public static final int MSG_ACCELERATION = 0x2070;
+    public static final int MSG_LOCATION_REPORT_2 = 0x5501;
+    public static final int MSG_LOCATION_REPORT_BLIND = 0x5502;
+    public static final int MSG_LOCATION_BATCH = 0x0704;
+    public static final int MSG_OIL_CONTROL = 0XA006;
+    public static final int MSG_TIME_SYNC_REQUEST = 0x0109;
+    public static final int MSG_TIME_SYNC_RESPONSE = 0x8109;
+    public static final int MSG_PHOTO = 0x8888;
+    public static final int MSG_TRANSPARENT = 0x0900;
+
+    public static final int RESULT_SUCCESS = 0;
+
+    public static ByteBuf formatMessage(int type, ByteBuf id, boolean shortIndex, ByteBuf data) {
+        ByteBuf buf = Unpooled.buffer();
+        buf.writeByte(0x7e);
+        buf.writeShort(type);
+        buf.writeShort(data.readableBytes());
+        buf.writeBytes(id);
+        if (shortIndex) {
+            buf.writeByte(1);
+        } else {
+            buf.writeShort(0);
+        }
+        buf.writeBytes(data);
+        data.release();
+        buf.writeByte(Checksum.xor(buf.nioBuffer(1, buf.readableBytes() - 1)));
+        buf.writeByte(0x7e);
+        return buf;
+    }
+
+    private void sendGeneralResponse(
+            Channel channel, SocketAddress remoteAddress, ByteBuf id, int type, int index) {
+        if (channel != null) {
+            ByteBuf response = Unpooled.buffer();
+            response.writeShort(index);
+            response.writeShort(type);
+            response.writeByte(RESULT_SUCCESS);
+            channel.writeAndFlush(new NetworkMessage(
+                    formatMessage(MSG_GENERAL_RESPONSE, id, false, response), remoteAddress));
+        }
+    }
+
+    private void sendGeneralResponse2(
+            Channel channel, SocketAddress remoteAddress, ByteBuf id, int type) {
+        if (channel != null) {
+            ByteBuf response = Unpooled.buffer();
+            response.writeShort(type);
+            response.writeByte(RESULT_SUCCESS);
+            channel.writeAndFlush(new NetworkMessage(
+                    formatMessage(MSG_GENERAL_RESPONSE_2, id, true, response), remoteAddress));
+        }
+    }
+
+    private String decodeAlarm(long value) {
+        
+        System.out.println("value trrrrrrrrrrrrrrrrrrrrrrrr ====================>>>>"+ value);
+        if (BitUtil.check(value, 0)) {
+                    System.out.println("ALARM_SOS");
+
+            return Position.ALARM_SOS;
+        }
+        if (BitUtil.check(value, 1)) {
+                                System.out.println("ALARM_OVERSPEED");
+
+            return Position.ALARM_OVERSPEED;
+        }
+        if (BitUtil.check(value, 5)) {
+                                            System.out.println("ALARM_GPS_ANTENNA_CUT");
+
+            return Position.ALARM_GPS_ANTENNA_CUT;
+        }
+        if (BitUtil.check(value, 4) || BitUtil.check(value, 9)
+                || BitUtil.check(value, 10) || BitUtil.check(value, 11)) {
+                                                        System.out.println("ALARM_FAULT");
+
+            return Position.ALARM_FAULT;
+        }
+        if (BitUtil.check(value, 7) || BitUtil.check(value, 18)) {
+            System.out.println("ALARM_LOW_BATTERY------>");
+         System.out.println("ALARM_LOW_BATTERY");
+            return Position.ALARM_LOW_BATTERY;
+        }
+        if (BitUtil.check(value, 8)) {
+            System.out.println("ALARM_POWER_OFF");
+            return Position.ALARM_POWER_OFF;
+        }
+        if (BitUtil.check(value, 17)) {
+            System.out.println("ALARM_TAMPERING");
+            return Position.ALARM_TAMPERING;
+        }
+        if (BitUtil.check(value, 20)) {
+              System.out.println("ALARM_GEOFENCE");
+
+            return Position.ALARM_GEOFENCE;
+        }
+        if (BitUtil.check(value, 28)) {
+                          System.out.println("ALARM_MOVEMENT");
+
+            return Position.ALARM_MOVEMENT;
+        }
+        if (BitUtil.check(value, 29)) {
+                                      System.out.println("ALARM_ACCIDENT");
+
+            return Position.ALARM_ACCIDENT;
+        }
+        
+                System.out.println("herer for testing ======>>>>");
+
+        return null;
+    }
+
+    private int readSignedWord(ByteBuf buf) {
+        int value = buf.readUnsignedShort();
+        return BitUtil.check(value, 15) ? -BitUtil.to(value, 15) : BitUtil.to(value, 15);
+    }
+
+    private Date readDate(ByteBuf buf, TimeZone timeZone) {
+        DateBuilder dateBuilder = new DateBuilder(timeZone)
+                .setYear(BcdUtil.readInteger(buf, 2))
+                .setMonth(BcdUtil.readInteger(buf, 2))
+                .setDay(BcdUtil.readInteger(buf, 2))
+                .setHour(BcdUtil.readInteger(buf, 2))
+                .setMinute(BcdUtil.readInteger(buf, 2))
+                .setSecond(BcdUtil.readInteger(buf, 2));
+        return dateBuilder.getDate();
+    }
+
+    private String decodeId(ByteBuf id) {
+        String serial = ByteBufUtil.hexDump(id);
+        if (serial.matches("[0-9]+")) {
+            return serial;
+        } else {
+            long imei = id.getUnsignedShort(0);
+            imei = (imei << 32) + id.getUnsignedInt(2);
+            return String.valueOf(imei);
+        }
+    }
+
+    @Override
+    protected Object decode(
+            Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
+
+        ByteBuf buf = (ByteBuf) msg;
+
+//                System.out.println("value trrrrrrrrrrrrrrrrrrrrrrrr ====================>>>>"+ msg);
+
+        System.out.println("decode part ");
+        if (buf.getByte(buf.readerIndex()) == '(') {
+            String sentence = buf.toString(StandardCharsets.US_ASCII);
+            if (sentence.contains("BASE,2")) {
+                DateFormat dateFormat = new SimpleDateFormat("yyyyMMddHHmmss");
+                dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
+                String response = sentence.replace("TIME", dateFormat.format(new Date()));
+                if (channel != null) {
+                    channel.writeAndFlush(new NetworkMessage(
+                            Unpooled.copiedBuffer(response, StandardCharsets.US_ASCII), remoteAddress));
+                }
+                return null;
+            } 
+            else {
+                return decodeResult(channel, remoteAddress, sentence);
+            }
+        }
+                   Position position = new Position();
+                  position.setProtocol(getProtocolName());
+                   SocketAddress dataa = channel.localAddress();
+              InetSocketAddress address = (InetSocketAddress) dataa;
+               int port = address.getPort();
+             position.setPort(port);
+                    position.setDeviceId(getDeviceId());
+//                    System.out.println("===========================================");
+                 position.setBusiness_device_id(Context.getDataManager().getBusinessDeviceId((int)getDeviceId()));
+//                                     System.out.println("===========================================");
+
+        buf.readUnsignedByte(); // start marker
+        int type = buf.readUnsignedShort();
+        int attribute = buf.readUnsignedShort();
+        ByteBuf id = buf.readSlice(6); // phone number
+        int index;
+        if (type == MSG_LOCATION_REPORT_2 || type == MSG_LOCATION_REPORT_BLIND) {
+            index = buf.readUnsignedByte();
+        } else {
+            index = buf.readUnsignedShort();
+        }
+
+        DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, decodeId(id));
+        if (deviceSession == null) {
+            return null;
+        }
+
+//        if (!deviceSession.contains(DeviceSession.KEY_TIMEZONE)) {
+//            deviceSession.set(DeviceSession.KEY_TIMEZONE, getTimeZone(deviceSession.getDeviceId(), "GMT+8"));
+//        }
+
+        if (type == MSG_TERMINAL_REGISTER) {
+
+            if (channel != null) {
+                ByteBuf response = Unpooled.buffer();
+                response.writeShort(index);
+                response.writeByte(RESULT_SUCCESS);
+                response.writeBytes(decodeId(id).getBytes(StandardCharsets.US_ASCII));
+                channel.writeAndFlush(new NetworkMessage(
+                        formatMessage(MSG_TERMINAL_REGISTER_RESPONSE, id, false, response), remoteAddress));
+            }
+
+        } else if (type == MSG_TERMINAL_AUTH || type == MSG_HEARTBEAT || type == MSG_HEARTBEAT_2 || type == MSG_PHOTO) {
+
+            sendGeneralResponse(channel, remoteAddress, id, type, index);
+
+        } else if (type == MSG_LOCATION_REPORT) {
+                position.setBusiness_device_id(Context.getDataManager().getBusinessDeviceId((int)getDeviceId()));
+
+            sendGeneralResponse(channel, remoteAddress, id, type, index);
+
+            return decodeLocation(deviceSession, buf);
+
+        } else if (type == MSG_LOCATION_REPORT_2 || type == MSG_LOCATION_REPORT_BLIND) {
+
+//            if (BitUtil.check(attribute, 15)) {
+//                sendGeneralResponse2(channel, remoteAddress, id, type);
+//            }
+//
+//            return decodeLocation2(deviceSession, buf, type);
+
+        } else if (type == MSG_LOCATION_BATCH || type == MSG_LOCATION_BATCH_2) {
+
+//            System.out.println("MSG_LOCATION_BATCH part called ");
+             position.setBusiness_device_id(Context.getDataManager().getBusinessDeviceId((int)getDeviceId()));
+
+            sendGeneralResponse(channel, remoteAddress, id, type, index);
+
+            return decodeLocationBatch(deviceSession, buf, type);
+
+        } else if (type == MSG_TIME_SYNC_REQUEST) {
+
+            if (channel != null) {
+                Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
+                ByteBuf response = Unpooled.buffer();
+                response.writeShort(calendar.get(Calendar.YEAR));
+                response.writeByte(calendar.get(Calendar.MONTH) + 1);
+                response.writeByte(calendar.get(Calendar.DAY_OF_MONTH));
+                response.writeByte(calendar.get(Calendar.HOUR_OF_DAY));
+                response.writeByte(calendar.get(Calendar.MINUTE));
+                response.writeByte(calendar.get(Calendar.SECOND));
+                channel.writeAndFlush(new NetworkMessage(
+                        formatMessage(MSG_TERMINAL_REGISTER_RESPONSE, id, false, response), remoteAddress));
+            }
+
+        } else if (type == MSG_ACCELERATION) {
+
+                    position.setProtocol(getProtocolName());     
+                    position.setDeviceId(getDeviceId());
+                 position.setBusiness_device_id(Context.getDataManager().getBusinessDeviceId((int)getDeviceId()));
+               int pora = address.getPort();
+             position.setPort(pora);
+            getLastLocation(position, null);
+            StringBuilder data = new StringBuilder("[");
+            while (buf.readableBytes() > 2) {
+                buf.skipBytes(6); // time
+                if (data.length() > 1) {
+                    data.append(",");
+                }
+                data.append("[");
+                data.append(readSignedWord(buf));
+                data.append(",");
+                data.append(readSignedWord(buf));
+                data.append(",");
+                data.append(readSignedWord(buf));
+                data.append("]");
+            }
+            data.append("]");
+
+//            position.set(Position.KEY_G_SENSOR, data.toString());
+
+            return position;
+
+        } else if (type == MSG_TRANSPARENT) {
+
+            return decodeTransparent(deviceSession, buf);
+
+        }
+
+        return null;
+    }
+
+    private Position decodeResult(Channel channel, SocketAddress remoteAddress, String sentence) throws Exception {
+        DeviceSession deviceSession = getDeviceSession(channel, remoteAddress,null);
+        if (deviceSession != null) {
+            Position position = new Position(getProtocolName());
+            position.setDeviceId(deviceSession.getDeviceId());
+            getLastLocation(position, null);
+            position.set(Position.KEY_RESULT, sentence);
+            return position;
+        }
+        return null;
+    }
+
+    private void decodeExtension(Position position, ByteBuf buf, int endIndex) {
+        while (buf.readerIndex() < endIndex) {
+            int type = buf.readUnsignedByte();
+            int length = buf.readUnsignedByte();
+            switch (type) {
+                case 0x01:
+                    position.set(Position.KEY_ODOMETER, buf.readUnsignedInt() * 100L);
+                    break;
+                case 0x02:
+                    position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedShort() * 0.1);
+                    break;
+                case 0x03:
+                    position.set(Position.KEY_OBD_SPEED, buf.readUnsignedShort() * 0.1);
+                    break;
+                case 0x80:
+                    position.set(Position.KEY_OBD_SPEED, buf.readUnsignedByte());
+                    break;
+                case 0x81:
+                    position.set(Position.KEY_RPM, buf.readUnsignedShort());
+                    break;
+                case 0x82:
+                    position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.1);
+                    break;
+                case 0x83:
+                    position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte());
+                    break;
+                case 0x84:
+                    position.set(Position.KEY_COOLANT_TEMP, buf.readUnsignedByte() - 40);
+                    break;
+                case 0x85:
+                    position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort());
+                    break;
+                case 0x86:
+                    position.set("intakeTemp", buf.readUnsignedByte() - 40);
+                    break;
+                case 0x87:
+                    position.set("intakeFlow", buf.readUnsignedShort());
+                    break;
+                case 0x88:
+                    position.set("intakePressure", buf.readUnsignedByte());
+                    break;
+                case 0x89:
+                    position.set(Position.KEY_THROTTLE, buf.readUnsignedByte());
+                    break;
+                case 0x8B:
+                    position.set(Position.KEY_VIN, buf.readCharSequence(17, StandardCharsets.US_ASCII).toString());
+                    break;
+                case 0x8C:
+                    position.set(Position.KEY_OBD_ODOMETER, buf.readUnsignedInt() * 100L);
+                    break;
+                case 0x8D:
+                    position.set(Position.KEY_ODOMETER_TRIP, buf.readUnsignedShort() * 1000L);
+                    break;
+                case 0x8E:
+                    position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedByte());
+                    break;
+                case 0xA0:
+                    String codes = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString();
+                    position.set(Position.KEY_DTCS, codes.replace(',', ' '));
+                    break;
+                case 0xCC:
+                    position.set(Position.KEY_ICCID, buf.readCharSequence(20, StandardCharsets.US_ASCII).toString());
+                    
+//                    System.out.println("KEY_ICCID gettinggg-----????");
+                    break;
+                default:
+                    buf.skipBytes(length);
+                    break;
+            }
+        }
+    }
+
+    private void decodeCoordinates(Position position, ByteBuf buf) {
+
+//        int status = buf.readInt();
+//
+//        position.set(Position.KEY_IGNITION, BitUtil.check(status, 0));
+       	int flags=buf.readInt();
+//         System.out.println("flags=======================> "+flags);//4
+
+                                
+                                if(BitUtil.check(flags, 0)){
+                              System.out.println("setIgnition is ignition_on=======================> ");//4
+
+        	        	position.setIgnition(1);
+        	        	position.set("ignition_on", "yes");
+        	        	position.setTrip(1);
+        	        }else{
+                                System.out.println("setIgnition ignition_off=======================> ");//4
+
+        	        	position.setIgnition(2);
+        	        	position.set("ignition_off", "yes");
+        	        	position.setTrip(2);
+        	        }
+        position.set(Position.KEY_BLOCKED, BitUtil.check(flags, 10));
+        position.set(Position.KEY_CHARGE, BitUtil.check(flags, 26));
+
+        position.setValid(BitUtil.check(flags, 1));
+
+        double lat = buf.readUnsignedInt() * 0.000001;
+        double lon = buf.readUnsignedInt() * 0.000001;
+
+        if (BitUtil.check(flags, 2)) {
+            position.setLatitude(-lat);
+        } else {
+            position.setLatitude(lat);
+        }
+
+        if (BitUtil.check(flags, 3)) {
+            position.setLongitude(-lon);
+        } else {
+            position.setLongitude(lon);
+        }
+        
+//          if(BitUtil.check(flags, 24)){
+//                              System.out.println("AC ON=======================> ");//4
+//                                             //     position.set("ac", "on");
+//
+//                             position.setAc(1);        }else{
+//              System.out.println("AC OFF=======================> ");//4
+//                                 // position.set("ac", "off");
+//
+//                                            position.setAc(2); 
+//
+//        }
+//          if(BitUtil.check(flags, 25)){
+//                              System.out.println("AC ON=======================> ");//4
+//                                                  // position.set("ac", "on");
+//
+//                              //position.setAc(1);        }else{
+//              System.out.println("AC OFF=======================> ");//4
+//                                  // position.set("ac", "off");
+//
+//                                          //  position.setAc(2); 
+//
+//        }
+//          
+//          
+//               if(BitUtil.check(flags, 13)){
+//                              System.out.println("Harsh Acceleration== on=================> ");//4
+//                //   position.set("hard", "on");
+//
+//       }else{
+//              System.out.println("Harsh Acceleration=== 0===================> ");//4
+//
+//        }
+//               
+//               if(BitUtil.check(flags, 14)){
+//                                  //    position.set("break", "on");
+//
+//                              System.out.println("Harsh Braking= 0n=====================> ");//4
+//       }else{
+//                                 
+//
+//              System.out.println("Harsh Braking======================> ");//4
+//        }
+    }
+
+    private double decodeCustomDouble(ByteBuf buf) {
+        int b1 = buf.readByte();
+        int b2 = buf.readUnsignedByte();
+        int sign = b1 != 0 ? b1 / Math.abs(b1) : 1;
+        return sign * (Math.abs(b1) + b2 / 255.0);
+    }
+
+    private Position decodeLocation(DeviceSession deviceSession, ByteBuf buf)   {
+
+        Position position = new Position(getProtocolName());
+
+        position.set(Position.KEY_ALARM, decodeAlarm(buf.readUnsignedInt()));
+                  position.setProtocol(getProtocolName());
+                    position.setDeviceId(getDeviceId());
+      
+              //  calculatedmileage(position);
+
+        decodeCoordinates(position, buf);
+
+        position.setAltitude(buf.readShort());
+        position.setSpeed(UnitsConverter.knotsFromKph(buf.readUnsignedShort() * 0.1)*2);
+        position.setCourse(buf.readUnsignedShort());
+          
+//        position.setTime(readDate(buf, deviceSession.get(DeviceSession.KEY_TIMEZONE)));
+         DateBuilder dateBuilder = new DateBuilder(TimeZone.getTimeZone("UTC"))
+    	                .setYear(BcdUtil.readInteger(buf, 2))
+    	                .setMonth(BcdUtil.readInteger(buf, 2))
+    	                .setDay(BcdUtil.readInteger(buf, 2))
+    	                .setHour(BcdUtil.readInteger(buf, 2))
+    	                .setMinute(BcdUtil.readInteger(buf, 2))
+    	                .setSecond(BcdUtil.readInteger(buf, 2));
+    	        position.setTime(dateBuilder.getDate());
+                
+//                System.out.println("dateBuilder.getDate()======================>"+dateBuilder.getDate());
+        if (buf.readableBytes() == 20) {
+
+            buf.skipBytes(4); // remaining battery and mileage
+            position.set(Position.KEY_ODOMETER, buf.readUnsignedInt() * 1000);
+//                                position.setMileage(new Double(buf.readUnsignedInt() * 1000));
+//                        System.out.println("setMileage =========================>");
+
+//                    position.setMileage(new Double(buf.readUnsignedInt()));
+//                        System.out.println("setMileage =========================>");
+
+            position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.1);
+
+            buf.readUnsignedInt(); // area id
+            position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+            buf.skipBytes(3); // reserved
+
+            
+            
+            return position;
+
+        }
+//                System.out.println("buf.readableBytes() "+buf.readableBytes());
+
+        while (buf.readableBytes() > 32) {
+
+            try {
+                
+//                System.out.println("buf.readableBytes() "+buf.readableBytes());
+
+                int subtype = buf.readUnsignedByte();
+                int length = buf.readUnsignedByte();
+                int endIndex = buf.readerIndex() + length;
+                System.out.println("MSG_LOCATION_BATCH part 2 called ");
+                position.setBusiness_device_id(Context.getDataManager().getBusinessDeviceId((int)getDeviceId()));
+                                    System.out.println("subtype =========================>"+subtype);
+
+                switch (subtype) {
+                    case 0x01:
+//                        position.set(Position.KEY_ODOMETER, buf.readUnsignedInt() * 100);
+//                                                 System.out.println("in subtypr mi =========================>"+buf.readUnsignedInt()/10.0);
+
+                    position.setMileage(new Double(buf.readUnsignedInt()/10.0));
+
+                    System.out.println("in subtypr mi =========================>");
+                        break;
+                    case 0x02:
+                        position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedShort() * 0.1);
+                        break;
+                    case 0x2b:
+                        position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedInt());
+                        break;
+                    case 0x30:
+                        position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+                        break;
+                    case 0x31:
+                        position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
+                        break;
+                    case 0x33:
+                        String sentence = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString();
+                        if (sentence.startsWith("*M00")) {
+                                        System.out.println("1111 =========================>");
+
+                            String lockStatus = sentence.substring(8, 8 + 7);
+                            position.set(Position.KEY_BATTERY, Integer.parseInt(lockStatus.substring(2, 5)) * 0.01);
+                        }
+                        break;
+                    case 0x80:
+                        buf.readUnsignedByte(); // content
+                        endIndex = buf.writerIndex() - 2;
+                        decodeExtension(position, buf, endIndex);
+                        break;
+                    case 0x91:
+                          System.out.println("aaaa =========================>");
+
+//                        position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.1);
+                         System.out.println("aaaa =========================>");
+                                                            
+                        double battery = buf.readUnsignedShort() * 0.1;
+                        position.setBattery(battery);
+                        position.set(Position.KEY_RPM, buf.readUnsignedShort());
+                        position.set(Position.KEY_OBD_SPEED, buf.readUnsignedByte());
+                        position.set(Position.KEY_THROTTLE, buf.readUnsignedByte() * 100 / 255);
+                        position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedByte() * 100 / 255);
+                        position.set(Position.KEY_COOLANT_TEMP, buf.readUnsignedByte() - 40);
+                        buf.readUnsignedShort();
+                        position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.01);
+                        buf.readUnsignedShort();
+                        buf.readUnsignedInt();
+                        buf.readUnsignedShort();
+                        position.set(Position.KEY_FUEL_USED, buf.readUnsignedShort() * 0.01);
+                        break;
+                    case 0x94:
+                        if (length > 0) {
+                            position.set(
+                                    Position.KEY_VIN, buf.readCharSequence(length, StandardCharsets.US_ASCII).toString());
+                        }
+                        break;
+                    case 0xA7:
+                        position.set(Position.PREFIX_ADC + 1, buf.readUnsignedShort());
+                        position.set(Position.PREFIX_ADC + 2, buf.readUnsignedShort());
+                        break;
+                    case 0xAC:
+                        position.set(Position.KEY_ODOMETER, buf.readUnsignedInt());
+//                        position.setMileage(new Double(buf.readUnsignedInt()/100));
+                        
+//                        System.out.println("0xAC called");
+//                    position.setMileage(new Double(buf.readUnsignedInt()));
+
+                        break;
+                    case 0xD0:
+                        long userStatus = buf.readUnsignedInt();
+                        if (BitUtil.check(userStatus, 3)) {
+                            position.set(Position.KEY_ALARM, Position.ALARM_VIBRATION);
+                        }
+                        break;
+                    case 0xD3:
+                        position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.1);
+                        break;
+                    case 0xD4:
+                                    System.out.println("aaaaadwsdsd =========================>");
+
+                        position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
+                        break;
+                    case 0xD5:
+                        if (length == 2) {
+                            position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.01);
+                         System.out.println("sdscvsd =========================>");
+
+                        } else {
+                            int count = buf.readUnsignedByte();
+                            for (int i = 1; i <= count; i++) {
+                                position.set("lock" + i + "Id", ByteBufUtil.hexDump(buf.readSlice(5)));
+                                position.set("lock" + i + "Card", ByteBufUtil.hexDump(buf.readSlice(5)));
+                                position.set("lock" + i + "Battery", buf.readUnsignedByte());
+                                int status = buf.readUnsignedShort();
+                                position.set("lock" + i + "Locked", !BitUtil.check(status, 5));
+                            }
+                        }
+                        break;
+                    case 0xDA:
+                        buf.readUnsignedShort(); // string cut count
+                        int deviceStatus = buf.readUnsignedByte();
+                        position.set("string", BitUtil.check(deviceStatus, 0));
+                        position.set(Position.KEY_MOTION, BitUtil.check(deviceStatus, 2));
+                        position.set("cover", BitUtil.check(deviceStatus, 3));
+                        break;
+                    case 0xE6:
+                        while (buf.readerIndex() < endIndex) {
+                            int sensorIndex = buf.readUnsignedByte();
+                            buf.skipBytes(6); // mac
+                            position.set(Position.PREFIX_TEMP + sensorIndex, decodeCustomDouble(buf));
+                            position.set("humidity" + sensorIndex, decodeCustomDouble(buf));
+                        }
+                        break;
+                    case 0xEB:
+                        if (buf.getUnsignedShort(buf.readerIndex()) > 200) {
+                            Network network = new Network();
+                            int mcc = buf.readUnsignedShort();
+                            int mnc = buf.readUnsignedByte();
+                            while (buf.readerIndex() < endIndex) {
+                                network.addCellTower(CellTower.from(
+                                        mcc, mnc, buf.readUnsignedShort(), buf.readUnsignedShort(),
+                                        buf.readUnsignedByte()));
+                            }
+                            position.setNetwork(network);
+                        } else {
+                            while (buf.readerIndex() < endIndex) {
+                                int extendedLength = buf.readUnsignedShort();
+                                int extendedType = buf.readUnsignedShort();
+                                switch (extendedType) {
+                                    case 0x0001:
+                                        position.set("fuel1", buf.readUnsignedShort() * 0.1);
+                                        buf.readUnsignedByte(); // unused
+                                        break;
+                                    case 0x0023:
+                                        position.set("fuel2", Double.parseDouble(
+                                                buf.readCharSequence(6, StandardCharsets.US_ASCII).toString()));
+                                        break;
+                                    case 0x00CE:
+                                        position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+                                        break;
+                                    case 0x00D8:
+                                        Network network = new Network();
+                                        network.addCellTower(CellTower.from(
+                                                buf.readUnsignedShort(), buf.readUnsignedByte(),
+                                                buf.readUnsignedShort(), buf.readUnsignedInt()));
+                                        position.setNetwork(network);
+                                        break;
+                                    case 0xE1:
+                                        System.out.println("ALARM_LOW_BATTERY------>");
+                                        
+                                        double battery2 =buf.readUnsignedByte();
+                                                                     position.setBattery(battery2);
+
+                                        position.set(Position.KEY_BATTERY_LEVEL, battery2);
+                                        
+                                        break;
+                                    default:
+                                        buf.skipBytes(extendedLength - 2);
+                                        break;
+                                }
+                            }
+                        }
+                        break;
+                    case 0xED:
+                        String license = buf.readCharSequence(length, StandardCharsets.US_ASCII).toString().trim();
+                        position.set("driverLicense", license);
+                        break;
+                    case 0xEE:
+                        position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+                        position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.001);
+                        System.out.println("ALARM_LOW_BATTERY------>");
+                        
+                        position.set(Position.KEY_BATTERY, buf.readUnsignedShort() * 0.001);
+                        position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
+                        break;
+                    case 0xF3:
+                        while (buf.readerIndex() < endIndex) {
+                            int extendedType = buf.readUnsignedShort();
+                            int extendedLength = buf.readUnsignedByte();
+                            switch (extendedType) {
+                                case 0x0002:
+                                    position.set(Position.KEY_OBD_SPEED, buf.readUnsignedShort() * 0.1);
+                                    break;
+                                case 0x0003:
+                                    position.set(Position.KEY_RPM, buf.readUnsignedShort());
+                                    break;
+                                case 0x0004:
+                                    position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.001);
+                                    break;
+                                case 0x0005:
+                                    position.set(Position.KEY_OBD_ODOMETER, buf.readUnsignedInt() * 100);
+                                    break;
+                                case 0x0007:
+                                    position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.1);
+                                    break;
+                                case 0x0008:
+                                    position.set(Position.KEY_ENGINE_LOAD, buf.readUnsignedShort() * 0.1);
+                                    break;
+                                case 0x0009:
+                                    position.set(Position.KEY_COOLANT_TEMP, buf.readUnsignedShort() - 40);
+                                    break;
+                                case 0x000B:
+                                    position.set("intakePressure", buf.readUnsignedShort());
+                                    break;
+                                case 0x000C:
+                                    position.set("intakeTemp", buf.readUnsignedShort() - 40);
+                                    break;
+                                case 0x000D:
+                                    position.set("intakeFlow", buf.readUnsignedShort());
+                                    break;
+                                case 0x000E:
+                                    position.set(Position.KEY_THROTTLE, buf.readUnsignedShort() * 100 / 255);
+                                    break;
+                                case 0x0050:
+                                    position.set(Position.KEY_VIN, buf.readSlice(17).toString(StandardCharsets.US_ASCII));
+                                    break;
+                                case 0x0100:
+                                    position.set(Position.KEY_ODOMETER_TRIP, buf.readUnsignedShort() * 0.1);
+                                    break;
+                                case 0x0102:
+                                    position.set("tripFuel", buf.readUnsignedShort() * 0.1);
+                                    break;
+                                case 0x0112:
+                                    position.set("hardAccelerationCount", buf.readUnsignedShort());
+                                    break;
+                                case 0x0113:
+                                    position.set("hardDecelerationCount", buf.readUnsignedShort());
+                                    break;
+                                case 0x0114:
+                                    position.set("hardCorneringCount", buf.readUnsignedShort());
+                                    break;
+                                default:
+                                    buf.skipBytes(extendedLength);
+                                    break;
+                            }
+                        }
+                        break;
+                    case 0xFE:
+                        if (length == 1) {
+                            System.out.println("ALARM_LOW_BATTERY------>");
+                             double battery2 =buf.readUnsignedByte();
+                             position.setBattery(battery2);
+                                        position.set(Position.KEY_BATTERY_LEVEL, battery2);
+//                            position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
+                        } else {
+                            int mark = buf.readUnsignedByte();
+                            if (mark == 0x7C) {
+                                while (buf.readerIndex() < endIndex) {
+                                    int extendedType = buf.readUnsignedByte();
+                                    int extendedLength = buf.readUnsignedByte();
+                                    switch (extendedType) {
+                                        case 0x01:
+                                            long alarms = buf.readUnsignedInt();
+                                            if (BitUtil.check(alarms, 0)) {
+                                                position.set(Position.KEY_ALARM, Position.ALARM_ACCELERATION);
+                                                
+                                                System.out.println("ALARM_ACCELERATION");
+                                            }
+                                            if (BitUtil.check(alarms, 1)) {
+                                                                                                System.out.println("ALARM_BRAKING");
+
+                                                position.set(Position.KEY_ALARM, Position.ALARM_BRAKING);
+                                            }
+                                            if (BitUtil.check(alarms, 2)) {
+                                             System.out.println("ALARM_CORNERING");                                                                                                   System.out.println("ALARM_BRAKING");
+
+                                                position.set(Position.KEY_ALARM, Position.ALARM_CORNERING);
+                                            }
+                                            if (BitUtil.check(alarms, 3)) {
+                                                         System.out.println("ALARM_ACCIDENT");                                                                                                   System.out.println("ALARM_BRAKING");
+
+                                                position.set(Position.KEY_ALARM, Position.ALARM_ACCIDENT);
+                                            }
+                                            if (BitUtil.check(alarms, 4)) {
+                                                             System.out.println("ALARM_TAMPERING");                                                                                                   System.out.println("ALARM_BRAKING");
+
+                                                position.set(Position.KEY_ALARM, Position.ALARM_TAMPERING);
+                                            }
+                                            break;
+                                        default:
+                                            buf.skipBytes(extendedLength);
+                                            break;
+                                    }
+                                }
+                            }
+                            System.out.println("ALARM_LOW_BATTERY------>");
+                             double battery2 =buf.readUnsignedByte();
+                                                          position.setBattery(battery2);
+
+                                        position.set(Position.KEY_BATTERY_LEVEL, battery2);
+//                            position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
+
+
+                        }
+                        break;
+                    default:
+                        break;
+                }
+//                 StringBuilder sb = new StringBuilder();
+//                     sb.append(ByteBufUtil.hexDump(buf.readBytes(10)));
+//                     position.set("ICCID", sb.toString());
+//                      System.out.println("ICCID hereeeee=================> "+ sb.toString());
+//                      
+                      
+                buf.readerIndex(endIndex);
+            } catch (ClassNotFoundException ex) {
+                Logger.getLogger(Jt09xProtocolDecoder.class.getName()).log(Level.SEVERE, null, ex);
+            } catch (SQLException ex) {
+                Logger.getLogger(Jt09xProtocolDecoder.class.getName()).log(Level.SEVERE, null, ex);
+            }
+        }
+  StringBuilder sb = new StringBuilder();
+                     sb.append(ByteBufUtil.hexDump(buf.readBytes(10)));
+//                     position.set("ICCID", sb.toString());
+                      System.out.println("ICCID=================> "+ sb.toString());
+                        StringBuilder sba = new StringBuilder();
+                     sba.append(ByteBufUtil.hexDump(buf.readBytes(10)));
+                     position.set("ICCID", sba.toString());
+                      System.out.println("ICCID trueee=================> "+ sba.toString());
+        return position;
+    }
+
+//    private Position decodeLocation2(DeviceSession deviceSession, ByteBuf buf, int type) {
+//
+//        Position position = new Position(getProtocolName());
+//        position.setDeviceId(deviceSession.getDeviceId());
+//
+//        Jt600ProtocolDecoder.decodeBinaryLocation(buf, position);
+//        position.setValid(type != MSG_LOCATION_REPORT_BLIND);
+//
+//        position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+//        position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
+//        position.set(Position.KEY_ODOMETER, buf.readUnsignedInt() * 1000L);
+//
+//        int battery = buf.readUnsignedByte();
+//        if (battery <= 100) {
+//            System.out.println("ALARM_LOW_BATTERY------>");
+//
+//            position.set(Position.KEY_BATTERY_LEVEL, battery);
+//        } else if (battery == 0xAA) {
+//            System.out.println("ALARM_LOW_BATTERY------>");
+//
+//            position.set(Position.KEY_CHARGE, true);
+//        }
+//
+//        position.setNetwork(new Network(CellTower.fromCidLac(
+//                getConfig(), buf.readUnsignedInt(), buf.readUnsignedShort())));
+//
+//        int product = buf.readUnsignedByte();
+//        int status = buf.readUnsignedShort();
+//        int alarm = buf.readUnsignedShort();
+//
+//        if (product == 1 || product == 2) {
+//            if (BitUtil.check(alarm, 0)) {
+//                position.set(Position.KEY_ALARM, Position.ALARM_LOW_POWER);
+//            }
+//        } else if (product == 3) {
+//            position.set(Position.KEY_BLOCKED, BitUtil.check(status, 5));
+//            if (BitUtil.check(alarm, 1)) {
+//                position.set(Position.KEY_ALARM, Position.ALARM_LOW_POWER);
+//            }
+//            if (BitUtil.check(alarm, 2)) {
+//                position.set(Position.KEY_ALARM, Position.ALARM_VIBRATION);
+//            }
+//            if (BitUtil.check(alarm, 3)) {
+//                System.out.println("ALARM_LOW_BATTERY------>");
+//
+//                position.set(Position.KEY_ALARM, Position.ALARM_LOW_BATTERY);
+//            }
+//        }
+//
+//        position.set(Position.KEY_STATUS, status);
+//
+//        return position;
+//    }
+
+    private List<Position> decodeLocationBatch(DeviceSession deviceSession, ByteBuf buf, int type) {
+
+        
+        System.out.println("decodeLocationBatch");
+        List<Position> positions = new LinkedList<>();
+
+        int locationType = 0;
+        if (type == MSG_LOCATION_BATCH) {
+            buf.readUnsignedShort(); // count
+            locationType = buf.readUnsignedByte();
+        }
+                        Position position = new Position();
+
+        try {
+            position.setBusiness_device_id(Context.getDataManager().getBusinessDeviceId((int)getDeviceId()));
+        } catch (ClassNotFoundException ex) {
+            Logger.getLogger(Jt09xProtocolDecoder.class.getName()).log(Level.SEVERE, null, ex);
+        } catch (SQLException ex) {
+            Logger.getLogger(Jt09xProtocolDecoder.class.getName()).log(Level.SEVERE, null, ex);
+        }
+
+        while (buf.readableBytes() > 2) {
+            int length = type == MSG_LOCATION_BATCH_2 ? buf.readUnsignedByte() : buf.readUnsignedShort();
+            ByteBuf fragment = buf.readSlice(length);
+             position = decodeLocation(deviceSession, fragment);
+            if (locationType > 0) {
+                position.set(Position.KEY_ARCHIVE, true);
+            }
+            positions.add(position);
+        }
+
+        return positions;
+    }
+
+    private Position decodeTransparent(DeviceSession deviceSession, ByteBuf buf) {
+
+        int type = buf.readUnsignedByte();
+
+        if (type == 0xF0) {
+            
+                Position position = new Position(getProtocolName());
+                position.setDeviceId(getDeviceId());
+
+//            Date time = readDate(buf, deviceSession.get(DeviceSession.KEY_TIMEZONE));
+
+if (buf.readUnsignedByte() > 0) {
+    position.set(Position.KEY_ARCHIVE, true);
+}
+
+buf.readUnsignedByte(); // vehicle type
+
+int count;
+int subtype = buf.readUnsignedByte();
+switch (subtype) {
+    case 0x01:
+        count = buf.readUnsignedByte();
+        for (int i = 0; i < count; i++) {
+            int id = buf.readUnsignedShort();
+            int length = buf.readUnsignedByte();
+            switch (id) {
+                case 0x0102:
+                case 0x0528:
+                case 0x0546:
+                    position.set(Position.KEY_ODOMETER, buf.readUnsignedInt());
+                    break;
+                case 0x0103:
+                    position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedInt() * 0.01);
+                    break;
+                case 0x052A:
+                    position.set(Position.KEY_FUEL_LEVEL, buf.readUnsignedShort() * 0.01);
+                    break;
+                case 0x0105:
+                case 0x052C:
+                    position.set(Position.KEY_FUEL_USED, buf.readUnsignedInt() * 0.01);
+                    break;
+                case 0x014A:
+                case 0x0537:
+                case 0x0538:
+                case 0x0539:
+                    position.set(Position.KEY_FUEL_CONSUMPTION, buf.readUnsignedShort() * 0.01);
+                    break;
+                default:
+                    switch (length) {
+                        case 1:
+                            position.set(Position.PREFIX_IO + id, buf.readUnsignedByte());
+                            break;
+                        case 2:
+                            position.set(Position.PREFIX_IO + id, buf.readUnsignedShort());
+                            break;
+                        case 4:
+                            position.set(Position.PREFIX_IO + id, buf.readUnsignedInt());
+                            break;
+                        default:
+                            buf.skipBytes(length);
+                            break;
+                    }
+                    break;
+            }
+        }
+        decodeCoordinates(position, buf);
+        DateBuilder dateBuilder = new DateBuilder(TimeZone.getTimeZone("GMT+8"))
+                .setYear(BcdUtil.readInteger(buf, 2))
+                .setMonth(BcdUtil.readInteger(buf, 2))
+                .setDay(BcdUtil.readInteger(buf, 2))
+                .setHour(BcdUtil.readInteger(buf, 2))
+                .setMinute(BcdUtil.readInteger(buf, 2))
+                .setSecond(BcdUtil.readInteger(buf, 2));
+        position.setTime(dateBuilder.getDate());
+        break;
+    case 0x03:
+        count = buf.readUnsignedByte();
+        for (int i = 0; i < count; i++) {
+            int id = buf.readUnsignedShort();
+            int length = buf.readUnsignedByte();
+            switch (id) {
+                case 0x1A:
+                    position.set(Position.KEY_ALARM, Position.ALARM_ACCELERATION);
+                    break;
+                case 0x1B:
+                    position.set(Position.KEY_ALARM, Position.ALARM_BRAKING);
+                    break;
+                case 0x1C:
+                    position.set(Position.KEY_ALARM, Position.ALARM_CORNERING);
+                    break;
+                case 0x1D:
+                case 0x1E:
+                case 0x1F:
+                    position.set(Position.KEY_ALARM, Position.ALARM_LANE_CHANGE);
+                    break;
+                case 0x23:
+                    position.set(Position.KEY_ALARM, Position.ALARM_FATIGUE_DRIVING);
+                    break;
+                default:
+                    break;
+            }
+            buf.skipBytes(length);
+        }
+        decodeCoordinates(position, buf);
+        dateBuilder = new DateBuilder(TimeZone.getTimeZone("GMT+8"))
+                .setYear(BcdUtil.readInteger(buf, 2))
+                .setMonth(BcdUtil.readInteger(buf, 2))
+                .setDay(BcdUtil.readInteger(buf, 2))
+                .setHour(BcdUtil.readInteger(buf, 2))
+                .setMinute(BcdUtil.readInteger(buf, 2))
+                .setSecond(BcdUtil.readInteger(buf, 2));
+        position.setTime(dateBuilder.getDate());
+        
+        break;
+    case 0x0B:
+        if (buf.readUnsignedByte() > 0) {
+            position.set(Position.KEY_VIN, buf.readCharSequence(17, StandardCharsets.US_ASCII).toString());
+        }
+        getLastLocation(position, null);
+        break;
+    default:
+        return null;
+}
+
+return position;
+            
+        }
+
+        return null;
+    }
+private Position calculatedmileage (Position position) {
+            
+            double mileage = 0.0;
+            double last_mileage = 0.0;
+             double total_mileage = 0.0;
+            
+            Position last = getLastPosition(position.getDeviceId());
+            if(last != null) {
+
+                mileage += DistanceCalculator.distance(position.getLatitude(), position.getLongitude(),
+                        last.getLatitude(), last.getLongitude());
+               
+                mileage = BigDecimal.valueOf(mileage).setScale(2, RoundingMode.HALF_EVEN).doubleValue();
+                
+//                System.out.println(".........______Mileage_____........"+mileage);
+//                System.out.println(".........______last Mileage_____........"+last.getMileage());
+//                System.out.println(".........______total Mileage_____........"+last_mileage);
+
+          last_mileage =  mileage * 0.001;
+                  total_mileage  = last.getMileage() + last_mileage;
+                    
+                  
+                  System.out.println("org.traccar.protocol.TTobdnxnewProtocolDecoder.calculatedmileage()");
+            position.setMileage(total_mileage);
+                              System.out.println("org.traccar.protocol.TTobdnxnewProtocolDecoder.calculatedmileage()");
+
+//             System.out.println(".........______total Mileage_____........"+last_mileage);
+            position.set("mileage", last_mileage);
+              position.set("total_mileage", total_mileage);
+            }else{
+                   position.setMileage(0);
+            }
+            
+                 
+            return position ;
+        }
+
+private Position getLastPosition(long deviceId) {
+            if(Context.getConnectionManager() != null ){
+                return Context.getConnectionManager().getLastPosition(deviceId);
+            }
+            return null;
+        }
+}
